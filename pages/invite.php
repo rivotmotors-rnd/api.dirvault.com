@@ -1,3 +1,11 @@
+<?php
+declare(strict_types=1);
+
+session_start();
+
+$sessionInviterEmail = trim((string) ($_SESSION['admin_email'] ?? ''));
+$inviterEmail = trim((string) ($_GET['inviter_email'] ?? $sessionInviterEmail));
+?>
 
 <!DOCTYPE html>
 <html lang="en">
@@ -167,6 +175,11 @@ button:hover{
         </p>
 
         <form action="../api/send_invite.php" method="POST">
+            <input
+                type="hidden"
+                name="inviter_email"
+                value="<?php echo htmlspecialchars($inviterEmail, ENT_QUOTES, 'UTF-8'); ?>"
+            >
 
             <div class="form-group">
                 <label for="name">Full Name</label>

@@ -7,6 +7,31 @@ require __DIR__ . '/../config/db.php';
 
 header('Content-Type: application/json');
 
+function normalizeEmail(string $email): string
+{
+    return strtolower(trim($email));
+}
+
+function emailExistsOnAnotherUser(mysqli $conn, string $email, int $currentUserId): bool
+{
+    $normalizedEmail = normalizeEmail($email);
+
+    $statement = $conn->prepare(
+        'SELECT id
+         FROM users
+         WHERE LOWER(TRIM(email)) = ?
+           AND id <> ?
+         LIMIT 1'
+    );
+    $statement->bind_param('si', $normalizedEmail, $currentUserId);
+    $statement->execute();
+    $result = $statement->get_result();
+    $existingUser = $result->fetch_assoc();
+    $statement->close();
+
+    return (bool) $existingUser;
+}
+
 $otp = trim((string) ($_POST['otp'] ?? ''));
 $token = trim((string) ($_POST['token'] ?? ''));
 
@@ -23,7 +48,7 @@ if ($otp === '' || $token === '') {
 }
 
 $statement = $conn->prepare(
-    'SELECT id FROM users 
+    'SELECT id, email FROM users 
      WHERE invite_token = ? 
      AND otp = ? 
      AND otp_expiry > NOW() 
@@ -47,6 +72,20 @@ if (!$user) {
     echo json_encode([
         'status' => false,
         'message' => 'Invalid OTP'
+    ]);
+
+    exit;
+}
+
+if (emailExistsOnAnotherUser($conn, (string) ($user['email'] ?? ''), (int) $user['id'])) {
+
+    http_response_code(409);
+
+    echo json_encode([
+        'status' => false,
+        'error' => 'EMAIL_ALREADY_EXISTS',
+        'message' => 'This email already exists. Account cannot be created.',
+        'field' => 'email'
     ]);
 
     exit;

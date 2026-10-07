@@ -680,11 +680,11 @@ const response = await fetch('../api/verify_otp.php', {
     body: formData
 });
 
-    if (!response.ok) {
-        throw new Error('Invalid OTP. Please try again.');
-    }
-
     const result = await response.json();
+
+    if (!response.ok) {
+        throw new Error(result.message || 'Invalid OTP. Please try again.');
+    }
 
     if (!result.status) {
 

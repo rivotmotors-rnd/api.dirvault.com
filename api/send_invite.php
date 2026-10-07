@@ -13,6 +13,7 @@ require __DIR__ . '/../vendor/autoload.php';
 
 $appConfig = require __DIR__ . '/../config/app.php';
 $mailConfig = require __DIR__ . '/../config/mail.php';
+$drivaultConfig = require __DIR__ . '/../config/drivault.php';
 
 mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
 
@@ -42,6 +43,107 @@ function buildPublicUrl(string $baseUrl, string $path): string
     return rtrim($baseUrl, '/') . '/' . ltrim($path, '/');
 }
 
+function normalizeInvitationEmail(string $email): string
+{
+    return strtolower(trim($email));
+}
+
+function normalizeInvitationPhone(string $phone): string
+{
+    return preg_replace('/\D+/', '', $phone) ?? '';
+}
+
+function normalizeInviterValue(string $inviterEmail): string
+{
+    return strtolower(trim($inviterEmail));
+}
+
+function getInviterUserId(string $inviterEmail): string
+{
+    return normalizeInviterValue(explode('@', $inviterEmail)[0] ?? '');
+}
+
+function exitAlreadyInvited(string $field): void
+{
+    http_response_code(409);
+
+    echo json_encode([
+        'status' => false,
+        'error' => 'ALREADY_INVITED',
+        'message' => $field === 'email'
+            ? 'This email has already been invited by you.'
+            : 'This phone number has already been invited by you.',
+        'field' => $field,
+    ]);
+
+    exit;
+}
+
+function extractDrivaultUsers(string $responseBody): array
+{
+    $data = json_decode($responseBody, true);
+
+    if (!is_array($data)) {
+        return [];
+    }
+
+    $users = $data['ocs']['data']['users'] ?? [];
+
+    return is_array($users) ? array_values($users) : [];
+}
+
+function searchDrivaultUsers(string $endpoint, string $apiUsername, string $apiPassword, string $searchTerm): array
+{
+    $curlHandle = curl_init(rtrim($endpoint, '/') . '?search=' . rawurlencode($searchTerm));
+
+    curl_setopt_array($curlHandle, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_ENCODING => '',
+        CURLOPT_TIMEOUT => 5,
+        CURLOPT_CONNECTTIMEOUT => 3,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_2TLS,
+        CURLOPT_CUSTOMREQUEST => 'GET',
+        CURLOPT_HTTPAUTH => CURLAUTH_BASIC,
+        CURLOPT_USERPWD => $apiUsername . ':' . $apiPassword,
+        CURLOPT_HTTPHEADER => [
+            'OCS-APIRequest: true',
+            'Accept: application/json',
+        ],
+    ]);
+
+    $responseBody = curl_exec($curlHandle);
+    $curlError = curl_error($curlHandle);
+    $httpStatus = (int) curl_getinfo($curlHandle, CURLINFO_RESPONSE_CODE);
+    curl_close($curlHandle);
+
+    if ($responseBody === false) {
+        throw new RuntimeException('Unable to connect to Drivault: ' . $curlError);
+    }
+
+    if ($httpStatus >= 400) {
+        throw new RuntimeException('Drivault account verification failed.');
+    }
+
+    return extractDrivaultUsers((string) $responseBody);
+}
+
+function exitDrivaultAccountExists(string $field): void
+{
+    http_response_code(409);
+
+    echo json_encode([
+        'status' => false,
+        'error' => 'DRIVAULT_ACCOUNT_EXISTS',
+        'message' => $field === 'email'
+            ? 'This email already has a Drivault account.'
+            : 'This phone number already has a Drivault account.',
+        'field' => $field,
+    ]);
+
+    exit;
+}
+
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
     exit('Method not allowed.');
@@ -66,6 +168,106 @@ if (filter_var($email, FILTER_VALIDATE_EMAIL) === false) {
 if (preg_match('/^[0-9+\-\s()]{7,20}$/', $phone) !== 1) {
     http_response_code(422);
     exit('Invalid mobile number.');
+}
+
+if ($inviter_email === '') {
+    http_response_code(422);
+    exit('inviter_email is required.');
+}
+
+if (preg_match('/^[A-Za-z0-9@._-]{3,100}$/', $inviter_email) !== 1) {
+    http_response_code(422);
+    exit('Invalid inviter value.');
+}
+
+$normalizedEmail = normalizeInvitationEmail($email);
+$normalizedPhone = normalizeInvitationPhone($phone);
+$normalizedInviterEmail = normalizeInviterValue($inviter_email);
+$normalizedInviterUserId = getInviterUserId($inviter_email);
+
+try {
+    $conn->set_charset('utf8mb4');
+
+    $duplicateStatement = $conn->prepare(
+        "SELECT email, phone
+         FROM users
+         WHERE role = 'user'
+           AND invite_accepted = 'no'
+           AND (
+                LOWER(TRIM(inviter_email)) = ?
+                OR LOWER(TRIM(inviter_email)) = ?
+           )"
+    );
+    $duplicateStatement->bind_param('ss', $normalizedInviterEmail, $normalizedInviterUserId);
+    $duplicateStatement->execute();
+    $duplicateResult = $duplicateStatement->get_result();
+    $phoneAlreadyInvited = false;
+
+    while ($pendingInvitation = $duplicateResult->fetch_assoc()) {
+        if (normalizeInvitationEmail((string) ($pendingInvitation['email'] ?? '')) === $normalizedEmail) {
+            $duplicateStatement->close();
+            exitAlreadyInvited('email');
+        }
+
+        if (
+            $normalizedPhone !== '' &&
+            normalizeInvitationPhone((string) ($pendingInvitation['phone'] ?? '')) === $normalizedPhone
+        ) {
+            $phoneAlreadyInvited = true;
+        }
+    }
+
+    $duplicateStatement->close();
+
+    if ($phoneAlreadyInvited) {
+        exitAlreadyInvited('phone');
+    }
+} catch (mysqli_sql_exception $exception) {
+    error_log(
+        sprintf(
+            '[send_invite] Duplicate invitation check error: %s in %s on line %d',
+            $exception->getMessage(),
+            $exception->getFile(),
+            $exception->getLine()
+        )
+    );
+
+    http_response_code(500);
+    exit(formatDatabaseErrorMessage($exception));
+}
+
+$drivaultEndpoint = trim((string) ($drivaultConfig['endpoint'] ?? ''));
+$drivaultUsername = trim((string) ($drivaultConfig['username'] ?? ''));
+$drivaultPassword = trim((string) ($drivaultConfig['password'] ?? ''));
+
+if ($drivaultEndpoint === '' || $drivaultUsername === '' || $drivaultPassword === '') {
+    http_response_code(500);
+    exit('Drivault API is not configured.');
+}
+
+try {
+    if (count(searchDrivaultUsers($drivaultEndpoint, $drivaultUsername, $drivaultPassword, $normalizedEmail)) > 0) {
+        exitDrivaultAccountExists('email');
+    }
+
+    if (
+        $normalizedPhone !== '' &&
+        count(searchDrivaultUsers($drivaultEndpoint, $drivaultUsername, $drivaultPassword, $normalizedPhone)) > 0
+    ) {
+        exitDrivaultAccountExists('phone');
+    }
+} catch (Throwable $exception) {
+    error_log(
+        sprintf(
+            '[send_invite] Drivault account check error: %s in %s on line %d',
+            $exception->getMessage(),
+            $exception->getFile(),
+            $exception->getLine()
+        )
+    );
+
+    http_response_code(502);
+    exit('Unable to verify Drivault account status.');
 }
 
 $token = bin2hex(random_bytes(32));
@@ -232,24 +434,6 @@ try {
     $conn->begin_transaction();
     $transactionStarted = true;
 
-    // $statement = $conn->prepare(
-    //     'INSERT INTO users (name, email, phone, invite_token, otp, otp_expiry, is_verified, role, inviter, invite_accepted)
-    //      VALUES (?, ?, ?, ?, NULL, NULL, 0, ?, ?, ?)
-    //      ON DUPLICATE KEY UPDATE
-    //         name = VALUES(name),
-    //         phone = VALUES(phone),
-    //         invite_token = VALUES(invite_token),
-    //         otp = NULL,
-    //         otp_expiry = NULL,
-    //         is_verified = 0,
-    //         role = VALUES(role),
-    //         inviter = VALUES(inviter),
-    //         invite_accepted = VALUES(invite_accepted)'
-    // );
-    // $userRole = 'user';
-    // $inviteAccepted = 'no';
-    // $statement->bind_param('sssssss', $name, $email, $phone, $token, $userRole, $inviterName, $inviteAccepted);
-
 $statement = $conn->prepare(
     'INSERT INTO users (
         name,
@@ -265,18 +449,7 @@ $statement = $conn->prepare(
         invite_accepted
     )
     VALUES (?, ?, ?, ?, NULL, NULL, 0, ?, ?, ?, ?)
-
-    ON DUPLICATE KEY UPDATE
-        name = VALUES(name),
-        phone = VALUES(phone),
-        invite_token = VALUES(invite_token),
-        otp = NULL,
-        otp_expiry = NULL,
-        is_verified = 0,
-        role = VALUES(role),
-        inviter = VALUES(inviter),
-        inviter_email = VALUES(inviter_email),
-        invite_accepted = VALUES(invite_accepted)'
+    '
 );
 
 $userRole = 'user';

@@ -31,6 +31,31 @@ function extractDrivaultErrorMessage(string $responseBody): string
     return 'Drivault request failed.';
 }
 
+function normalizeEmail(string $email): string
+{
+    return strtolower(trim($email));
+}
+
+function emailExistsOnAnotherUser(mysqli $conn, string $email, int $currentUserId): bool
+{
+    $normalizedEmail = normalizeEmail($email);
+
+    $statement = $conn->prepare(
+        'SELECT id
+         FROM users
+         WHERE LOWER(TRIM(email)) = ?
+           AND id <> ?
+         LIMIT 1'
+    );
+    $statement->bind_param('si', $normalizedEmail, $currentUserId);
+    $statement->execute();
+    $result = $statement->get_result();
+    $existingUser = $result->fetch_assoc();
+    $statement->close();
+
+    return (bool) $existingUser;
+}
+
 $plainPassword = (string) ($_POST['password'] ?? '');
 $confirmPassword = (string) ($_POST['confirm_password'] ?? '');
 $token = trim((string) ($_POST['token'] ?? ''));
@@ -98,6 +123,13 @@ if (!$user) {
 if ($verifiedInviteToken !== '' && (string) ($user['invite_token'] ?? '') !== $verifiedInviteToken) {
     http_response_code(409);
     exit('This invitation link has been replaced by a newer invite.');
+}
+
+$invitedEmail = trim((string) ($user['email'] ?? ''));
+
+if ($invitedEmail !== '' && emailExistsOnAnotherUser($conn, $invitedEmail, (int) $user['id'])) {
+    http_response_code(409);
+    exit('This email already exists. Account cannot be created.');
 }
 
 $endpoint = trim((string) ($drivaultConfig['endpoint'] ?? ''));

@@ -48,20 +48,41 @@ function jsonResponse(int $statusCode, array $payload): void
     exit;
 }
 
-function findInvitePhone(mysqli $conn, string $token): ?string
+function normalizeEmail(string $email): string
 {
-    $statement = $conn->prepare('SELECT phone FROM users WHERE invite_token = ? LIMIT 1');
+    return strtolower(trim($email));
+}
+
+function findInvite(mysqli $conn, string $token): ?array
+{
+    $statement = $conn->prepare('SELECT id, email, phone FROM users WHERE invite_token = ? LIMIT 1');
     $statement->bind_param('s', $token);
     $statement->execute();
     $result = $statement->get_result();
     $user = $result->fetch_assoc();
     $statement->close();
 
-    if (!$user) {
-        return null;
-    }
+    return $user ?: null;
+}
 
-    return trim((string) ($user['phone'] ?? ''));
+function emailExistsOnAnotherUser(mysqli $conn, string $email, int $currentUserId): bool
+{
+    $normalizedEmail = normalizeEmail($email);
+
+    $statement = $conn->prepare(
+        'SELECT id
+         FROM users
+         WHERE LOWER(TRIM(email)) = ?
+           AND id <> ?
+         LIMIT 1'
+    );
+    $statement->bind_param('si', $normalizedEmail, $currentUserId);
+    $statement->execute();
+    $result = $statement->get_result();
+    $user = $result->fetch_assoc();
+    $statement->close();
+
+    return (bool) $user;
 }
 function sendOtpSms(string $phone, string $otp, array $smsConfig): array
 {
@@ -157,9 +178,9 @@ if ($token === '') {
     exit('Token is required.');
 }
 
-$phone = findInvitePhone($conn, $token);
+$invite = findInvite($conn, $token);
 
-if ($phone === null) {
+if ($invite === null) {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         jsonResponse(404, [
             'status' => false,
@@ -169,6 +190,24 @@ if ($phone === null) {
 
     http_response_code(404);
     exit('Invitation token not found.');
+}
+
+$inviteId = (int) ($invite['id'] ?? 0);
+$email = trim((string) ($invite['email'] ?? ''));
+$phone = trim((string) ($invite['phone'] ?? ''));
+
+if ($email !== '' && emailExistsOnAnotherUser($conn, $email, $inviteId)) {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        jsonResponse(409, [
+            'status' => false,
+            'error' => 'EMAIL_ALREADY_EXISTS',
+            'message' => 'This email already exists. Account cannot be created.',
+            'field' => 'email',
+        ]);
+    }
+
+    http_response_code(409);
+    exit('This email already exists. Account cannot be created.');
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'GET') {
